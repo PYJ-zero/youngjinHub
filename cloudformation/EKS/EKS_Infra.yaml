@@ -1,0 +1,756 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+  ### 최신 amzn2 hvm 아미
+  ###############
+  ###############
+
+Parameters:
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  IAMUserName:
+    Type: String
+    Description: "Enter your iam username what make cloudformation"
+
+Resources:
+  YZEKSVPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: 100.10.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Join
+            - ''
+            - - !Ref 'AWS::StackName'
+              - '-YZ-EKS-VPC2'
+
+  ### GROUP
+  ###############
+  ###############
+
+  ### 신규 policy를 위한 
+  ### 깡통 Group
+  ###############
+  ###############
+  YZEmptyGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: "YZ-Empty-Group"
+
+  ### EKS Cluster 사용을 위해
+  ### cloudformation 사용자의 신규 access key 생성
+  ### 그리고 parameter store에 저장
+  ###############
+  ###############
+  YZAccessKey:
+    Type: "AWS::IAM::AccessKey"
+    Properties:
+      UserName: !Ref IAMUserName
+  YZAccessKeyParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: !Sub "/${IAMUserName}/accesskey"
+      Type: "String"
+      Value: !Ref YZAccessKey
+  YZSecretKeyParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: !Sub "/${IAMUserName}/secretkey"
+      Type: "String"
+      Value: !GetAtt YZAccessKey.SecretAccessKey
+  YZIamUserParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: !Sub "/${IAMUserName}/username"
+      Type: "String"
+      Value: !Ref IAMUserName
+
+
+  ### Bastion Host 만들기
+  ###############
+  ###############
+
+  BastionHost:
+    Type: 'AWS::EC2::Instance'
+    DependsOn: YZEKSNodeGroup
+    Properties:
+      InstanceType: t3.micro
+      SubnetId: !Ref PublicSubnet01
+      ImageId: !Ref LatestAmiId
+      SecurityGroupIds:
+        - !Ref BastionSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Join
+            - ''
+            - - !Ref 'AWS::StackName'
+              - '-bastion-host'
+      IamInstanceProfile: !Ref InstanceSSMProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -ex
+          yum install jq -y
+
+          export USERNAME=$(aws ssm describe-parameters --region ap-northeast-2 --query "Parameters[?ends_with(Name, '/accesskey')].Name" | jq -r '.[] | split("/") | .[1]')
+
+          # Get the access key parameter from SSM
+          export ACCESS_KEY=$(aws ssm get-parameter --name "/$USERNAME/accesskey" --query "Parameter.Value" --output text --region ap-northeast-2)
+
+          # Get the secret key parameter from SSM
+          export SECRET_KEY=$(aws ssm get-parameter --name "/$USERNAME/secretkey" --query "Parameter.Value" --output text --region ap-northeast-2)
+
+          # Configure the AWS CLI with the retrieved keys and default region
+          aws configure set aws_access_key_id "$ACCESS_KEY"
+          aws configure set aws_secret_access_key "$SECRET_KEY"
+          aws configure set default.region ap-northeast-2
+
+          export ACCOUNTID=$(aws sts get-caller-identity --query 'Account' --output text)
+          export VPC_ID=$(curl -s http://169.254.169.254/latest/meta-data/network/interfaces/macs/$(curl -s http://169.254.169.254/latest/meta-data/network/interfaces/macs/)/vpc-id)
+
+          # Install kubectl
+          curl -LO https://storage.googleapis.com/kubernetes-release/release/v1.23.6/bin/linux/amd64/kubectl
+          chmod +x ./kubectl
+          mkdir -p $HOME/bin && cp ./kubectl $HOME/bin/kubectl && export PATH=$PATH:$HOME/bin
+          echo 'export PATH=$PATH:$HOME/bin' >> ~/.bashrc
+
+          # Install eksctl
+          curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+          sudo mv /tmp/eksctl /usr/local/bin
+
+          sleep 3
+
+          # Update kubeconfig
+          aws eks update-kubeconfig --region ap-northeast-2 --name YZ-eks-cluster-02
+
+          # Associate IAM OIDC provider
+          eksctl utils associate-iam-oidc-provider --region ap-northeast-2 --cluster YZ-eks-cluster-02 --approve
+
+          # Create IAM service account for Load Balancer Controller
+          eksctl create iamserviceaccount \
+            --cluster=YZ-eks-cluster-02 \
+            --namespace=kube-system \
+            --name=aws-load-balancer-controller \
+            --role-name YZLBControllerRole2 \
+            --attach-policy-arn=arn:aws:iam::$ACCOUNTID:policy/YZLBControllerPolicy \
+            --approve
+
+          sleep 70
+
+          # Install Helm
+          curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 > get_helm.sh
+          chmod 700 get_helm.sh
+          ./get_helm.sh
+          helm repo add stable https://charts.helm.sh/stable
+          helm repo add eks https://aws.github.io/eks-charts
+          helm repo update
+          curl -L https://git.io/get_helm.sh | bash -s -- --version v3.8.2
+
+          helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+          -n kube-system \
+          --set clusterName=YZ-eks-cluster-02 \
+          --set serviceAccount.create=false \
+          --set serviceAccount.name=aws-load-balancer-controller \
+          --set image.repository=602401143452.dkr.ecr.ap-northeast-2.amazonaws.com/amazon/aws-load-balancer-controller \
+          --set region=ap-northeast-2 \
+          --set vpcid=$VPC_ID
+
+  ### SG
+  ###############
+  ############### 
+  
+  #Bastion sg
+  BastionSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Security group for bastion host
+      VpcId: !Ref 'YZEKSVPC'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  #EKS Cluster sg
+  ###############
+  EKSClusterSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Security group for EKS Cluster
+      VpcId: !Ref 'YZEKSVPC'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          
+  ### 서브넷 만들기 
+  ### Public 1,2 | Private 1,2 | DB 1,2
+  ###############
+  ###############
+
+  PublicSubnet01:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref 'YZEKSVPC'
+      AvailabilityZone: ap-northeast-2a
+      CidrBlock: 100.0.10.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Join
+            - ''
+            - - !Ref 'AWS::StackName'
+              - '-public-subnet-01-a'
+
+  PublicSubnet02:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref 'YZEKSVPC'
+      AvailabilityZone: ap-northeast-2c
+      CidrBlock: 100.0.20.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Join
+            - ''
+            - - !Ref 'AWS::StackName'
+              - '-public-subnet-02-c'
+
+  PrivateSubnet01:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref 'YZEKSVPC'
+      AvailabilityZone: ap-northeast-2a
+      CidrBlock: 100.0.30.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Join
+            - ''
+            - - !Ref 'AWS::StackName'
+              - '-private-subnet-01-a'
+
+  PrivateSubnet02:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref 'YZEKSVPC'
+      AvailabilityZone: ap-northeast-2c
+      CidrBlock: 100.0.40.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Join
+            - ''
+            - - !Ref 'AWS::StackName'
+              - '-private-subnet-02-c'
+
+  DBSubnet01:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref 'YZEKSVPC'
+      AvailabilityZone: ap-northeast-2a
+      CidrBlock: 100.0.50.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Join
+            - ''
+            - - !Ref 'AWS::StackName'
+              - '-db-subnet-01-a'
+
+  DBSubnet02:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref 'YZEKSVPC'
+      AvailabilityZone: ap-northeast-2c
+      CidrBlock: 100.0.60.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Join
+            - ''
+            - - !Ref 'AWS::StackName'
+              - '-db-subnet-02-c'
+
+### DB Sunbet 만들기
+###############
+  YZDBSubnetGroup01:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: 'db subnet' 
+      DBSubnetGroupName: YZ-DB-Subnet-01
+      SubnetIds: 
+        - !Ref DBSubnet01
+        - !Ref DBSubnet02
+      Tags: 
+        - Key: Name
+          Value : !Join
+            - ''
+            - - !Ref 'AWS::StackName'
+              - '-DB-Subnet-01'
+
+  ### IGW 만들기
+  ### IGW <-> VPC 연결
+  ###############
+  ###############
+
+  InternetGateway01:
+    Type: 'AWS::EC2::InternetGateway'
+  
+  InternetGatewayAttachment:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref YZEKSVPC
+      InternetGatewayId: !Ref InternetGateway01
+  
+  ### Public 라우팅 테이블 만들기
+  ### Public Subnet과 연결하기
+  ### Public route <-> IGW 연결하기
+  ###############
+  ###############
+
+  # Create Route Table
+  PublicRouteTable01:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref 'YZEKSVPC'
+      Tags:
+        - Key: Name
+          Value : !Join
+            - ''
+            - - !Ref 'AWS::StackName'
+              - '-public-route-table-01'
+
+  PublicRoute01:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: !Ref PublicRouteTable01
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway01
+
+  PublicSubnet01RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref PublicRouteTable01
+      SubnetId: !Ref PublicSubnet01
+
+  PublicSubnet02RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref PublicRouteTable01
+      SubnetId: !Ref PublicSubnet02
+
+  ### NAT 만들기
+  ### Private route table 만들기
+  ### Private subnet 연결
+  ###############
+  ###############
+
+  NatGateway01:
+    Type: 'AWS::EC2::NatGateway'
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP01.AllocationId
+      SubnetId: !Ref PublicSubnet01
+      Tags:
+        - Key: Name
+          Value : !Join
+            - ''
+            - - !Ref 'AWS::StackName'
+              - '-nat-01'
+
+  NATGatewayEIP01:
+    Type: 'AWS::EC2::EIP'
+    Properties:
+      Domain: vpc
+
+  PrivateRouteTable01:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref 'YZEKSVPC'
+      Tags:
+        - Key: Name
+          Value : !Join
+            - ''
+            - - !Ref 'AWS::StackName'
+              - '-private-route-table-01'
+
+  PrivateRoute01:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable01
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway01
+
+  PrivateSubnet01RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable01
+      SubnetId: !Ref PrivateSubnet01
+
+  PrivateSubnet02RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable01
+      SubnetId: !Ref PrivateSubnet02
+
+  PrivateSubnet03RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable01
+      SubnetId: !Ref DBSubnet01
+
+  PrivateSubnet04RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable01
+      SubnetId: !Ref DBSubnet02
+
+  ### POLICY
+  ###############
+  ###############
+
+  ### EKS LB Controller policy
+  YZLBControllerPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: YZLBControllerPolicy2
+      PolicyDocument:
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "iam:CreateServiceLinkedRole"
+                    ],
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "iam:AWSServiceName": "elasticloadbalancing.amazonaws.com"
+                        }
+                    }
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "ec2:DescribeAccountAttributes",
+                        "ec2:DescribeAddresses",
+                        "ec2:DescribeAvailabilityZones",
+                        "ec2:DescribeInternetGateways",
+                        "ec2:DescribeVpcs",
+                        "ec2:DescribeVpcPeeringConnections",
+                        "ec2:DescribeSubnets",
+                        "ec2:DescribeSecurityGroups",
+                        "ec2:DescribeInstances",
+                        "ec2:DescribeNetworkInterfaces",
+                        "ec2:DescribeTags",
+                        "ec2:GetCoipPoolUsage",
+                        "ec2:DescribeCoipPools",
+                        "elasticloadbalancing:DescribeLoadBalancers",
+                        "elasticloadbalancing:DescribeLoadBalancerAttributes",
+                        "elasticloadbalancing:DescribeListeners",
+                        "elasticloadbalancing:DescribeListenerCertificates",
+                        "elasticloadbalancing:DescribeSSLPolicies",
+                        "elasticloadbalancing:DescribeRules",
+                        "elasticloadbalancing:DescribeTargetGroups",
+                        "elasticloadbalancing:DescribeTargetGroupAttributes",
+                        "elasticloadbalancing:DescribeTargetHealth",
+                        "elasticloadbalancing:DescribeTags"
+                    ],
+                    "Resource": "*"
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "cognito-idp:DescribeUserPoolClient",
+                        "acm:ListCertificates",
+                        "acm:DescribeCertificate",
+                        "iam:ListServerCertificates",
+                        "iam:GetServerCertificate",
+                        "waf-regional:GetWebACL",
+                        "waf-regional:GetWebACLForResource",
+                        "waf-regional:AssociateWebACL",
+                        "waf-regional:DisassociateWebACL",
+                        "wafv2:GetWebACL",
+                        "wafv2:GetWebACLForResource",
+                        "wafv2:AssociateWebACL",
+                        "wafv2:DisassociateWebACL",
+                        "shield:GetSubscriptionState",
+                        "shield:DescribeProtection",
+                        "shield:CreateProtection",
+                        "shield:DeleteProtection"
+                    ],
+                    "Resource": "*"
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "ec2:AuthorizeSecurityGroupIngress",
+                        "ec2:RevokeSecurityGroupIngress"
+                    ],
+                    "Resource": "*"
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "ec2:CreateSecurityGroup"
+                    ],
+                    "Resource": "*"
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "ec2:CreateTags"
+                    ],
+                    "Resource": "arn:aws:ec2:*:*:security-group/*",
+                    "Condition": {
+                        "StringEquals": {
+                            "ec2:CreateAction": "CreateSecurityGroup"
+                        },
+                        "Null": {
+                            "aws:RequestTag/elbv2.k8s.aws/cluster": "false"
+                        }
+                    }
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "ec2:CreateTags",
+                        "ec2:DeleteTags"
+                    ],
+                    "Resource": "arn:aws:ec2:*:*:security-group/*",
+                    "Condition": {
+                        "Null": {
+                            "aws:RequestTag/elbv2.k8s.aws/cluster": "true",
+                            "aws:ResourceTag/elbv2.k8s.aws/cluster": "false"
+                        }
+                    }
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "ec2:AuthorizeSecurityGroupIngress",
+                        "ec2:RevokeSecurityGroupIngress",
+                        "ec2:DeleteSecurityGroup"
+                    ],
+                    "Resource": "*",
+                    "Condition": {
+                        "Null": {
+                            "aws:ResourceTag/elbv2.k8s.aws/cluster": "false"
+                        }
+                    }
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "elasticloadbalancing:CreateLoadBalancer",
+                        "elasticloadbalancing:CreateTargetGroup"
+                    ],
+                    "Resource": "*",
+                    "Condition": {
+                        "Null": {
+                            "aws:RequestTag/elbv2.k8s.aws/cluster": "false"
+                        }
+                    }
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "elasticloadbalancing:CreateListener",
+                        "elasticloadbalancing:DeleteListener",
+                        "elasticloadbalancing:CreateRule",
+                        "elasticloadbalancing:DeleteRule"
+                    ],
+                    "Resource": "*"
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "elasticloadbalancing:AddTags",
+                        "elasticloadbalancing:RemoveTags"
+                    ],
+                    "Resource": [
+                        "arn:aws:elasticloadbalancing:*:*:targetgroup/*/*",
+                        "arn:aws:elasticloadbalancing:*:*:loadbalancer/net/*/*",
+                        "arn:aws:elasticloadbalancing:*:*:loadbalancer/app/*/*"
+                    ],
+                    "Condition": {
+                        "Null": {
+                            "aws:RequestTag/elbv2.k8s.aws/cluster": "true",
+                            "aws:ResourceTag/elbv2.k8s.aws/cluster": "false"
+                        }
+                    }
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "elasticloadbalancing:AddTags",
+                        "elasticloadbalancing:RemoveTags"
+                    ],
+                    "Resource": [
+                        "arn:aws:elasticloadbalancing:*:*:listener/net/*/*/*",
+                        "arn:aws:elasticloadbalancing:*:*:listener/app/*/*/*",
+                        "arn:aws:elasticloadbalancing:*:*:listener-rule/net/*/*/*",
+                        "arn:aws:elasticloadbalancing:*:*:listener-rule/app/*/*/*"
+                    ]
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "elasticloadbalancing:ModifyLoadBalancerAttributes",
+                        "elasticloadbalancing:SetIpAddressType",
+                        "elasticloadbalancing:SetSecurityGroups",
+                        "elasticloadbalancing:SetSubnets",
+                        "elasticloadbalancing:DeleteLoadBalancer",
+                        "elasticloadbalancing:ModifyTargetGroup",
+                        "elasticloadbalancing:ModifyTargetGroupAttributes",
+                        "elasticloadbalancing:DeleteTargetGroup"
+                    ],
+                    "Resource": "*",
+                    "Condition": {
+                        "Null": {
+                            "aws:ResourceTag/elbv2.k8s.aws/cluster": "false"
+                        }
+                    }
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "elasticloadbalancing:RegisterTargets",
+                        "elasticloadbalancing:DeregisterTargets"
+                    ],
+                    "Resource": "arn:aws:elasticloadbalancing:*:*:targetgroup/*/*"
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "elasticloadbalancing:SetWebAcl",
+                        "elasticloadbalancing:ModifyListener",
+                        "elasticloadbalancing:AddListenerCertificates",
+                        "elasticloadbalancing:RemoveListenerCertificates",
+                        "elasticloadbalancing:ModifyRule"
+                    ],
+                    "Resource": "*"
+                }
+            ]
+        }
+      Groups:
+        - !Ref YZEmptyGroup
+
+
+  ### ROLE
+  ###############
+  ###############
+
+  ### EKS LB Controller role 만들기
+  # YZLBControllerRole:
+  #   Type: AWS::IAM::Role
+  #   Properties:
+  #     RoleName: YZLBControllerRole
+  #     AssumeRolePolicyDocument:
+  #       Version: '2012-10-17'
+  #       Statement:
+  #         - Effect: Allow
+  #           Principal:
+  #             Service:
+  #               - eks.amazonaws.com
+  #           Action:
+  #             - sts:AssumeRole
+
+  ### EKS Cluster role 만들기
+  YZeksclusterrole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: YZeksclusterrole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonEKSClusterPolicy'
+
+  ### EKS Node group role 만들기
+  YZeksnodegrouprole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: YZeksnodegrouprole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - ec2.amazonaws.com
+            Action: 
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy'
+        - 'arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly'
+        - 'arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy'
+
+  ### SSM 접속 가능 IAM Role 만들기
+  IAMRoleForEC2SSM:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: iam-role-for-ec2ssm
+      AssumeRolePolicyDocument: 
+        Version: '2012-10-17'
+        Statement:
+           - Effect: Allow
+             Principal:
+               Service:
+                 - ec2.amazonaws.com
+             Action:
+               - 'sts:AssumeRole'
+      ManagedPolicyArns: 
+        - 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
+        - 'arn:aws:iam::aws:policy/ReadOnlyAccess'
+        - 'arn:aws:iam::aws:policy/AmazonEKSClusterPolicy'
+
+  ### SSM 접속 가능 IAM role profile 만들기
+  InstanceSSMProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      InstanceProfileName: iam-role-for-ec2ssm
+      Path: /
+      Roles:
+        - !Ref IAMRoleForEC2SSM
+
+  ### EKS Cluster 만들기
+  ### EKS Node group 만들기
+  ###############
+  ###############
+
+  YZEKSCluster:
+    Type: 'AWS::EKS::Cluster'
+    Properties:
+      Name: YZ-eks-cluster-02
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnet01
+          - !Ref PrivateSubnet02
+          - !Ref PublicSubnet01
+          - !Ref PublicSubnet02
+        SecurityGroupIds:
+          - !Ref EKSClusterSecurityGroup
+      RoleArn: !GetAtt YZeksclusterrole.Arn
+
+  YZEKSNodeGroup:
+    Type: 'AWS::EKS::Nodegroup'
+    Properties:
+      ClusterName: !Ref YZEKSCluster
+      NodegroupName: YZ-eks-nodegroup-01
+      ScalingConfig:
+        DesiredSize: 1
+        MaxSize: 2
+        MinSize: 1
+      Subnets:
+        - !Ref PrivateSubnet01
+        - !Ref PrivateSubnet02
+      InstanceTypes:
+        - t3.medium
+      NodeRole: !GetAtt YZeksnodegrouprole.Arn
