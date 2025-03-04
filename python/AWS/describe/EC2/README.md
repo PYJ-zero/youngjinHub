@@ -52,9 +52,9 @@
 스크립트를 실행하여 EC2 인스턴스 정보를 수집합니다.
     
 1. **코드 실행**
-    ₩₩₩bash
+    ```bash
     python <script_name>.py
-
+    
 실행 시 스크립트는 다음과 같은 작업을 수행합니다:
 	•	지정된 CREDENTIALS_DIR 내의 모든 CSV 파일을 읽어 AWS 자격증명을 로드합니다.
 	•	각 CSV 파일에 대해 AWS 세션을 생성하고, STS를 통해 계정 ID를 확인합니다.
