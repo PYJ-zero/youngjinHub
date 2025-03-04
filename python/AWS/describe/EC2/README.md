@@ -56,8 +56,8 @@
     python <script_name>.py
 
 실행 시 스크립트는 다음과 같은 작업을 수행합니다
-•	지정된 CREDENTIALS_DIR 내의 모든 CSV 파일을 읽어 AWS 자격증명을 로드합니다.
-•	각 CSV 파일에 대해 AWS 세션을 생성하고, STS를 통해 계정 ID를 확인합니다.
-•	계정 ID에 매핑된 리전 목록에 따라 각 리전에서 EC2 인스턴스 정보를 조회합니다.
-•	인스턴스의 상세 정보(Instance ID, 인스턴스 타입, 상태, Public/Private IP, AutoScaling Group, Launch Template 등)를 수집합니다.
-•	수집된 데이터를 hosts_ec2_YYYY-MM-DD-HH-MM.csv 형식의 Excel 파일로 저장합니다.
+- 지정된 CREDENTIALS_DIR 내의 모든 CSV 파일을 읽어 AWS 자격증명을 로드합니다.
+- 각 CSV 파일에 대해 AWS 세션을 생성하고, STS를 통해 계정 ID를 확인합니다.
+- 계정 ID에 매핑된 리전 목록에 따라 각 리전에서 EC2 인스턴스 정보를 조회합니다.
+- 인스턴스의 상세 정보(Instance ID, 인스턴스 타입, 상태, Public/Private IP, AutoScaling Group, Launch Template 등)를 수집합니다.
+- 수집된 데이터를 hosts_ec2_YYYY-MM-DD-HH-MM.csv 형식의 Excel 파일로 저장합니다.
